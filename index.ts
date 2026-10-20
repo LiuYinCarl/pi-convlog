@@ -132,7 +132,7 @@ export default function (pi: ExtensionAPI) {
 
     await ensureHeader(ctx.cwd);
     await append(
-      `\n## [${clock()}] 提问\n\n${prompt}\n\n${answer || "（无文本回答）"}${status}\n---\n`,
+      `\n## [${clock()}] 提问\n\n${prompt}\n\n${answer || "（无文本回答）"}\n${status}\n---\n`,
     );
   });
 
