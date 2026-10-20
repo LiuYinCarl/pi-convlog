@@ -3,7 +3,8 @@
  *
  * 设计思路与 ai-explain.el 的对话日志一致：
  *   - 每个自然日一个文件 <目录>/YYYY-MM-DD.md，跨零点自动切换；
- *   - 每轮对话（用户提问 + 助手最终回答）在 turn_end 时落盘一次；
+ *   - 每轮对话（用户提问 + 助手最终回答）在 turn_end 时落盘一次，
+ *     提问正文在 before_agent_start 捕获，避免自动续跑回合重复记录；
  *   - 文件内容即 markdown 正文，可直接作为知识库素材；
  *   - 回答正文只取文本块：工具调用、思考过程等中间噪声不进日志。
  *
@@ -23,8 +24,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // 分支条目与内容块的最小结构（与 summarize.ts 示例相同的做法，
 // 只用 import type 引入宿主类型，运行时零依赖）
 type TextBlock = { type?: unknown; text?: unknown };
-type EntryMessage = { role?: unknown; content?: unknown };
-type SessionEntry = { type?: unknown; message?: EntryMessage };
 
 function logDir(): string | null {
   const raw = process.env.PI_CONVLOG_DIR ?? "";
@@ -62,21 +61,7 @@ function messageText(content: unknown): string {
   return parts.join("").trim();
 }
 
-/** 当前分支里最后一条用户消息的正文（即本轮提问） */
-function lastUserPrompt(branch: SessionEntry[]): string {
-  for (let i = branch.length - 1; i >= 0; i--) {
-    const entry = branch[i];
-    if (
-      entry &&
-      typeof entry === "object" &&
-      entry.type === "message" &&
-      entry.message?.role === "user"
-    ) {
-      return messageText(entry.message.content);
-    }
-  }
-  return "";
-}
+/** 消息正文：只提取文本块 */
 
 export default function (pi: ExtensionAPI) {
   const dir = logDir();
@@ -84,8 +69,8 @@ export default function (pi: ExtensionAPI) {
 
   // 写盘串行队列：追加之间保持先后顺序，避免并发回合交错
   let writeChain: Promise<void> = Promise.resolve();
-  // 已落盘的回合 id，防边界重入导致重复记录
-  const loggedTurnIds = new Set<string>();
+  // 提问正文队列：before_agent_start 捕获、turn_end 消费（FIFO，与排队回合配对）
+  const promptQueue: string[] = [];
   // 今天是否已写过会话头（每个自然日、每个会话各写一次）
   let headerDay = "";
 
@@ -116,13 +101,17 @@ export default function (pi: ExtensionAPI) {
     headerDay = "";
   });
 
-  pi.on("turn_end", async (event, ctx) => {
-    // 只记录带用户消息的回合；自定义消息触发的回合没有提问正文，跳过
-    const prompt = lastUserPrompt(ctx.sessionManager.getBranch());
-    if (!prompt) return;
+  pi.on("before_agent_start", (event) => {
+    // 只收用户消息开启的回合；自定义消息与自动续跑（continuation）不产生
+    // 提问，不入队，turn_end 时自然跳过，避免同一提问被重复记录
+    if (event.messageType === "user") {
+      promptQueue.push(event.prompt);
+    }
+  });
 
-    if (loggedTurnIds.has(event.messageEntryId)) return;
-    loggedTurnIds.add(event.messageEntryId);
+  pi.on("turn_end", async (event, ctx) => {
+    const prompt = promptQueue.shift();
+    if (prompt === undefined) return;
 
     const answer = messageText(event.message.content);
     const status =

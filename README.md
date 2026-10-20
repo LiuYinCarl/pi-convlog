@@ -24,7 +24,7 @@ pi install ./
 ```
 
 `pi install` 会把本目录注册为本地 pi 包（写入 `~/.pi/agent/settings.json`），之后每次启动
-pi 自动加载。`pi list` 可以看到它，`pi remove pi-convlog` 可移除。
+pi 自动加载。`pi list` 可以看到它，`pi remove <source>`（source 即 `pi list` 显示的那行）可移除。
 
 或者直接把目录链接到扩展目录（同样会自动加载）：
 
@@ -39,7 +39,7 @@ ln -s ~/github/pi-convlog ~/.pi/agent/extensions/pi-convlog
 | 取值 | 效果 |
 |------|------|
 | 未设置 | 默认保存到 `~/.pi/conversations/` |
-| `<目录>` | 保存到指定目录（支持 `~/...` 与相对路径） |
+| `<目录>` | 保存到指定目录（支持 `~/...` 与相对路径；相对路径以 pi 启动时的工作目录为基准） |
 | `off`（或 `0` / `false` / `no`） | 整体关闭，不写任何文件 |
 
 想和 Emacs 插件的日志合并成一个知识库，把两边指到同一目录即可，例如 shell 配置里：
