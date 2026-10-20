@@ -80,6 +80,6 @@ export PI_CONVLOG_DIR=~/.emacs.d/ai-explain
 
 ## 发布（可选）
 
-推到 GitHub 或发布到 npm 后，可用 `pi install git:github.com/<you>/pi-convlog` /
+推到 GitHub 或发布到 npm 后，可用 `pi install git:github.com/LiuYinCarl/pi-convlog` /
 `pi install npm:pi-convlog` 安装。`package.json` 已带 `pi-package` 关键词，npm 发布后
 有机会出现在 [Pi package gallery](https://pi.dev/packages)。
