@@ -8,6 +8,7 @@
  *     一条记录不会被拆成多次写入，也就不会和多会话的记录交错插入；
  *   - 时间戳来自会话本身（用户 / 助手消息的 timestamp），不用写盘时刻，
  *     排队、延迟落盘、跨零点都不会让时间线错位；
+ *   - 会话头每个会话每天一次；恢复会话 / 重载扩展后按日志文件内容去重，不会重复写；
  *   - 文件内容即 markdown 正文，可直接作为知识库素材；
  *   - 回答正文只取文本块：工具调用、思考过程等中间噪声不进日志。
  *
@@ -19,7 +20,7 @@
  *   pi install ./           把本目录注册为本地 pi 包（写入 ~/.pi/agent/settings.json）
  *   或把本目录链接/复制到 ~/.pi/agent/extensions/pi-convlog
  */
-import { appendFile, mkdir, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type {
@@ -44,19 +45,19 @@ function logDir(): string | null {
 const pad = (n: number) => String(n).padStart(2, "0");
 
 /** 毫秒时间戳 → 本地自然日 YYYY-MM-DD */
-function dayStamp(ms: number): string {
+export function dayStamp(ms: number): string {
   const date = new Date(ms);
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 /** 毫秒时间戳 → 本地时:分 */
-function clock(ms: number): string {
+export function clock(ms: number): string {
   const date = new Date(ms);
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 /** 消息正文：只提取文本块 */
-function messageText(content: unknown): string {
+export function messageText(content: unknown): string {
   if (typeof content === "string") return content.trim();
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
@@ -74,7 +75,7 @@ function messageText(content: unknown): string {
 }
 
 /** 一条「提问 + 回答」记录；时间取自会话内消息，而不是落盘时刻 */
-interface QaRecord {
+export interface QaRecord {
   prompt: string;
   /** 提问时间：用户消息的 timestamp（毫秒） */
   askedAt: number;
@@ -83,6 +84,37 @@ interface QaRecord {
   outcome: TurnOutcome;
   /** 回答是否因输出上限被截断 */
   truncated: boolean;
+}
+
+/** 单条记录的 markdown 文本：提问 + 回答 + 异常标记 + 分隔符 */
+export function formatRecord(record: QaRecord): string {
+  const marks: string[] = [];
+  if (record.outcome === "aborted") marks.push("> [本轮已中断]");
+  else if (record.outcome === "error") marks.push("> [本轮出错]");
+  if (record.truncated) marks.push("> [回答触达输出上限，可能不完整]");
+  const marksText = marks.length > 0 ? `\n${marks.join("\n")}\n` : "";
+  const prompt = record.prompt || "（无文本提问）";
+  const answer = record.answer || "（无文本回答）";
+  return `\n## [${clock(record.askedAt)}] 提问\n\n${prompt}\n\n${answer}\n${marksText}\n---\n`;
+}
+
+/** 文件里是否已经有该会话当天的会话头（恢复 / 重载后避免重复写） */
+export function hasSessionHeader(
+  fileContent: string,
+  sessionId: string,
+  day: string,
+): boolean {
+  const id = `(${sessionId})`;
+  for (const line of fileContent.split("\n")) {
+    if (
+      line.startsWith("# 会话 ") &&
+      line.includes(id) &&
+      line.includes(` · ${day} `)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -112,21 +144,36 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** 会话头：每个会话、每个自然日一次，时间取该文件里第一条提问的时间 */
-  const header = (ctx: ExtensionContext, day: string, at: number): string => {
+  const header = (
+    ctx: ExtensionContext,
+    id: string,
+    day: string,
+    at: number,
+  ): string => {
     const name = pi.getSessionName()?.trim() || "未命名会话";
-    const id = ctx.sessionManager.getSessionId().slice(0, 8);
     return `\n# 会话 ${name} (${id}) · ${ctx.cwd} · ${day} ${clock(at)}\n`;
   };
 
-  const formatRecord = (record: QaRecord): string => {
-    const marks: string[] = [];
-    if (record.outcome === "aborted") marks.push("> [本轮已中断]");
-    else if (record.outcome === "error") marks.push("> [本轮出错]");
-    if (record.truncated) marks.push("> [回答触达输出上限，可能不完整]");
-    const marksText = marks.length > 0 ? `\n${marks.join("\n")}\n` : "";
-    const prompt = record.prompt || "（无文本提问）";
-    const answer = record.answer || "（无文本回答）";
-    return `\n## [${clock(record.askedAt)}] 提问\n\n${prompt}\n\n${answer}\n${marksText}\n---\n`;
+  /**
+   * 该会话当天是否已经写过会话头：内存标记优先，其次看日志文件。
+   * 恢复会话 / 重载扩展后内存标记是空的，靠文件内容避免重复写。
+   */
+  const alreadyHeadered = async (
+    ctx: ExtensionContext,
+    id: string,
+    day: string,
+  ): Promise<boolean> => {
+    if (headeredDays.has(day)) return true;
+    try {
+      const content = await readFile(path.join(dir, `${day}.md`), "utf8");
+      if (hasSessionHeader(content, id, day)) {
+        headeredDays.add(day);
+        return true;
+      }
+    } catch {
+      // 文件还不存在或暂时读不了：照常写会话头
+    }
+    return false;
   };
 
   /**
@@ -149,11 +196,12 @@ export default function (pi: ExtensionAPI) {
       group.parts.push(formatRecord(record));
     }
 
+    const id = ctx.sessionManager.getSessionId().slice(0, 8);
     for (const [day, group] of byDay) {
       let text = "";
-      if (!headeredDays.has(day)) {
+      if (!(await alreadyHeadered(ctx, id, day))) {
         headeredDays.add(day);
-        text += header(ctx, day, group.firstAskedAt);
+        text += header(ctx, id, day, group.firstAskedAt);
       }
       text += group.parts.join("");
       await append(path.join(dir, `${day}.md`), text);

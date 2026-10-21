@@ -1,6 +1,6 @@
 {
   "name": "pi-convlog",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "pi 扩展：把与 AI 的每轮对话按天追加到 markdown 文件，方便构建个人知识库",
   "type": "module",
   "license": "MIT",
@@ -18,7 +18,11 @@
     "extensions": ["index.ts"]
   },
   "scripts": {
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

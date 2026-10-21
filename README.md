@@ -77,7 +77,8 @@ export PI_CONVLOG_DIR=~/.emacs.d/ai-explain
 ---
 ```
 
-`# 会话` 行每个会话每天写一次；`## [HH:MM] 提问` 的时间是该条用户消息的时间。
+`# 会话` 行每个会话每天写一次；恢复会话或重载扩展后会按会话 id 和日期检查日志文件，
+不会重复写。`## [HH:MM] 提问` 的时间是该条用户消息的时间。
 
 ## 说明与限制
 
@@ -93,8 +94,9 @@ export PI_CONVLOG_DIR=~/.emacs.d/ai-explain
 ## 开发
 
 ```bash
-npm install      # 只装类型检查用的开发依赖，运行时不依赖任何包
+npm install      # 类型检查 / 测试用的开发依赖（含 pi 的类型包），运行时不依赖任何 npm 包
 npm run typecheck
+npm test         # 纯函数（时间戳、正文提取、记录格式、会话头识别）的回归测试
 ```
 
 `index.ts` 是唯一入口，由 `package.json` 的 `pi.extensions` 指向；改完直接重启 pi

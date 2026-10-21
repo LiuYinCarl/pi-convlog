@@ -8,8 +8,9 @@
     "strict": true,
     "noUncheckedIndexedAccess": false,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts"]
+  "include": ["index.ts", "test"]
 }
