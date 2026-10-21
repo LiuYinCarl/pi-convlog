@@ -3,8 +3,11 @@
  *
  * 设计思路与 ai-explain.el 的对话日志一致：
  *   - 每个自然日一个文件 <目录>/YYYY-MM-DD.md，跨零点自动切换；
- *   - 每轮对话（用户提问 + 助手最终回答）在 turn_end 时落盘一次，
- *     提问正文在 before_agent_start 捕获，避免自动续跑回合重复记录；
+ *   - 按会话收集：一条用户消息开启一条记录，回答取本轮最后一个有正文的助手消息；
+ *     整轮在 agent_settled（重试 / 续跑 / 压缩都已收敛）时一次性落盘，
+ *     一条记录不会被拆成多次写入，也就不会和多会话的记录交错插入；
+ *   - 时间戳来自会话本身（用户 / 助手消息的 timestamp），不用写盘时刻，
+ *     排队、延迟落盘、跨零点都不会让时间线错位；
  *   - 文件内容即 markdown 正文，可直接作为知识库素材；
  *   - 回答正文只取文本块：工具调用、思考过程等中间噪声不进日志。
  *
@@ -16,14 +19,18 @@
  *   pi install ./           把本目录注册为本地 pi 包（写入 ~/.pi/agent/settings.json）
  *   或把本目录链接/复制到 ~/.pi/agent/extensions/pi-convlog
  */
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
-// 分支条目与内容块的最小结构（与 summarize.ts 示例相同的做法，
+// 内容块的最小结构（与 summarize.ts 示例相同的做法，
 // 只用 import type 引入宿主类型，运行时零依赖）
 type TextBlock = { type?: unknown; text?: unknown };
+type TurnOutcome = "completed" | "aborted" | "error";
 
 function logDir(): string | null {
   const raw = process.env.PI_CONVLOG_DIR ?? "";
@@ -34,16 +41,21 @@ function logDir(): string | null {
   return path.resolve(value);
 }
 
-function dayStamp(now = new Date()): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+const pad = (n: number) => String(n).padStart(2, "0");
+
+/** 毫秒时间戳 → 本地自然日 YYYY-MM-DD */
+function dayStamp(ms: number): string {
+  const date = new Date(ms);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-function clock(now = new Date()): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+/** 毫秒时间戳 → 本地时:分 */
+function clock(ms: number): string {
+  const date = new Date(ms);
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** 消息正文：只提取文本块 */
 function messageText(content: unknown): string {
   if (typeof content === "string") return content.trim();
   if (!Array.isArray(content)) return "";
@@ -61,25 +73,37 @@ function messageText(content: unknown): string {
   return parts.join("").trim();
 }
 
-/** 消息正文：只提取文本块 */
+/** 一条「提问 + 回答」记录；时间取自会话内消息，而不是落盘时刻 */
+interface QaRecord {
+  prompt: string;
+  /** 提问时间：用户消息的 timestamp（毫秒） */
+  askedAt: number;
+  /** 回答：本轮最后一个有正文的助手消息 */
+  answer: string;
+  outcome: TurnOutcome;
+  /** 回答是否因输出上限被截断 */
+  truncated: boolean;
+}
 
 export default function (pi: ExtensionAPI) {
   const dir = logDir();
   if (!dir) return;
 
-  // 写盘串行队列：追加之间保持先后顺序，避免并发回合交错
+  // 写盘串行队列：同一进程内保持先后顺序
   let writeChain: Promise<void> = Promise.resolve();
-  // 提问正文队列：before_agent_start 捕获、turn_end 消费（FIFO，与排队回合配对）
-  const promptQueue: string[] = [];
-  // 今天是否已写过会话头（每个自然日、每个会话各写一次）
-  let headerDay = "";
+  // 按会话收集：当前问答、本轮已结束待落盘的问答
+  let current: QaRecord | null = null;
+  let finished: QaRecord[] = [];
+  // 本会话已经写过会话头的自然日（每个会话、每天一次）
+  const headeredDays = new Set<string>();
 
-  const append = (text: string): Promise<void> => {
-    const file = path.join(dir, `${dayStamp()}.md`);
+  const append = (file: string, text: string): Promise<void> => {
     writeChain = writeChain
       .then(async () => {
         await mkdir(dir, { recursive: true });
-        await appendFile(file, text, "utf8");
+        // 空文件从第一行开始写，不留开头空行
+        const size = await stat(file).then((s) => s.size, () => 0);
+        await appendFile(file, size > 0 ? text : text.replace(/^\n/, ""), "utf8");
       })
       .catch((error) => {
         console.error(`[pi-convlog] 保存对话记录失败: ${error}`);
@@ -87,50 +111,123 @@ export default function (pi: ExtensionAPI) {
     return writeChain;
   };
 
-  const ensureHeader = (cwd: string): Promise<void> => {
-    const day = dayStamp();
-    if (headerDay === day) return Promise.resolve();
-    headerDay = day;
-    const now = new Date();
-    const name = pi.getSessionName() ?? "未命名会话";
-    return append(`\n# 会话 ${name} · ${cwd} · ${dayStamp(now)} ${clock(now)}\n`);
+  /** 会话头：每个会话、每个自然日一次，时间取该文件里第一条提问的时间 */
+  const header = (ctx: ExtensionContext, day: string, at: number): string => {
+    const name = pi.getSessionName()?.trim() || "未命名会话";
+    const id = ctx.sessionManager.getSessionId().slice(0, 8);
+    return `\n# 会话 ${name} (${id}) · ${ctx.cwd} · ${day} ${clock(at)}\n`;
+  };
+
+  const formatRecord = (record: QaRecord): string => {
+    const marks: string[] = [];
+    if (record.outcome === "aborted") marks.push("> [本轮已中断]");
+    else if (record.outcome === "error") marks.push("> [本轮出错]");
+    if (record.truncated) marks.push("> [回答触达输出上限，可能不完整]");
+    const marksText = marks.length > 0 ? `\n${marks.join("\n")}\n` : "";
+    const prompt = record.prompt || "（无文本提问）";
+    const answer = record.answer || "（无文本回答）";
+    return `\n## [${clock(record.askedAt)}] 提问\n\n${prompt}\n\n${answer}\n${marksText}\n---\n`;
+  };
+
+  /**
+   * 落盘：把本轮收集到的记录按「提问所在自然日」分组，
+   * 每组拼成一段一次性追加 —— 单次写入，记录之间不会再被别的会话切开。
+   */
+  const flush = async (ctx: ExtensionContext): Promise<void> => {
+    const batch = finished;
+    finished = [];
+    if (batch.length === 0) return;
+
+    const byDay = new Map<string, { firstAskedAt: number; parts: string[] }>();
+    for (const record of batch) {
+      const day = dayStamp(record.askedAt);
+      let group = byDay.get(day);
+      if (!group) {
+        group = { firstAskedAt: record.askedAt, parts: [] };
+        byDay.set(day, group);
+      }
+      group.parts.push(formatRecord(record));
+    }
+
+    for (const [day, group] of byDay) {
+      let text = "";
+      if (!headeredDays.has(day)) {
+        headeredDays.add(day);
+        text += header(ctx, day, group.firstAskedAt);
+      }
+      text += group.parts.join("");
+      await append(path.join(dir, `${day}.md`), text);
+    }
   };
 
   pi.on("session_start", () => {
-    // 新会话重置会话头标记；真正的写盘延迟到第一个回合，避免空会话也建文件
-    headerDay = "";
+    // 新会话 / 恢复 / 切换：清空按会话收集的缓冲
+    current = null;
+    finished = [];
+    headeredDays.clear();
   });
 
-  pi.on("before_agent_start", (event) => {
-    // 只收用户消息开启的回合；自定义消息与自动续跑（continuation）不产生
-    // 提问，不入队，turn_end 时自然跳过，避免同一提问被重复记录
-    if (event.messageType === "user") {
-      promptQueue.push(event.prompt);
+  pi.on("message_end", (event) => {
+    const message = event.message;
+
+    if (message.role === "user") {
+      // 新的用户消息开启一条新记录；排队消息逐条成为独立记录
+      if (current) finished.push(current);
+      current = {
+        prompt: messageText(message.content),
+        askedAt: message.timestamp,
+        answer: "",
+        outcome: "completed",
+        truncated: false,
+      };
+      return;
     }
+
+    if (message.role !== "assistant" || !current) return;
+
+    // 一轮里可能有多个助手回合（调用工具前后各说一段），
+    // 只保留最后一个有正文的回答，避免把中间过程当成答案记下来
+    const text = messageText(message.content);
+    if (text) current.answer = text;
+    if (message.stopReason === "length") current.truncated = true;
+    if (message.stopReason === "error") current.outcome = "error";
+    else if (message.stopReason === "aborted") current.outcome = "aborted";
   });
 
-  pi.on("turn_end", async (event, ctx) => {
-    const prompt = promptQueue.shift();
-    if (prompt === undefined) return;
+  pi.on("turn_end", (event) => {
+    // 本轮状态以最后一次 turn_end 为准（自动重试成功后会回到 completed）
+    if (current) current.outcome = event.outcome;
+  });
 
-    const answer = messageText(event.message.content);
-    const status =
-      event.outcome === "completed"
-        ? ""
-        : `\n> [本轮${event.outcome === "aborted" ? "已中断" : "出错"}]\n`;
+  pi.on("agent_settled", async (event, ctx) => {
+    // 整轮真正结束：重试、续跑、压缩都已收敛，此刻整批一次性落盘
+    if (current) {
+      if (event.aborted && current.outcome === "completed") {
+        current.outcome = "aborted";
+      }
+      finished.push(current);
+      current = null;
+    }
+    await flush(ctx);
+  });
 
-    await ensureHeader(ctx.cwd);
-    await append(
-      `\n## [${clock()}] 提问\n\n${prompt}\n\n${answer || "（无文本回答）"}\n${status}\n---\n`,
-    );
+  pi.on("session_shutdown", async (_event, ctx) => {
+    // 退出 / 切换会话时兜底落盘；已落盘则缓冲为空，天然幂等
+    if (current) {
+      finished.push(current);
+      current = null;
+    }
+    await flush(ctx);
   });
 
   pi.registerCommand("convlog-status", {
     description: "显示对话记录目录与今日文件",
     handler: async (_args, ctx) => {
       if (ctx.hasUI) {
+        const day = dayStamp(Date.now());
+        const pending = finished.length + (current ? 1 : 0);
         ctx.ui.notify(
-          `对话记录目录: ${dir}（今日文件: ${dayStamp()}.md）`,
+          `对话记录目录: ${dir}（今日文件: ${day}.md，待落盘: ${pending} 条）`,
           "info",
         );
       }
